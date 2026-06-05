@@ -1,0 +1,472 @@
+// ── Amalgame.WebAuthn ────────────────────────────────────────
+//
+// A WebAuthn / passkeys relying-party (server) verifier. It handles
+// the two ceremonies a server must check:
+//
+//   - Registration (navigator.credentials.create): parse the
+//     attestationObject (CBOR) + clientDataJSON, validate the client
+//     data (type / challenge / origin), confirm the rpIdHash and the
+//     User-Present flag, and extract the credential id + the COSE EC2
+//     public key the authenticator generated. The app persists those.
+//
+//   - Authentication (navigator.credentials.get): validate the client
+//     data, confirm rpIdHash + User-Present, then VERIFY the assertion
+//     signature over (authenticatorData ‖ SHA-256(clientDataJSON)) with
+//     the stored public key — the cryptographic heart of the login —
+//     and check that the signature counter advanced (cloned-key
+//     detection).
+//
+// Scope (v0.1.0): ES256 (P-256) credentials — the algorithm platform
+// authenticators / passkeys use — and attestation format "none" (the
+// common, privacy-preserving default; the public key is bound by the
+// assertion signature at login, not by an attestation certificate
+// chain). Attestation-statement / cert-chain verification (packed,
+// tpm, android-key, fido-u2f) is a future addition; for now any format
+// is accepted for *extraction* but no attestation trust is asserted.
+//
+// All binary inputs are byte lists (List<int>, 0..255) — the app
+// base64url-decodes the values the browser posts (Bytes.FromBase64Url)
+// before calling in. clientDataJSON is passed as its raw bytes (it is
+// both hashed and parsed). Verification never throws; every failure
+// returns a result with Ok = false and a specific Error.
+
+namespace Amalgame.WebAuthn
+
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Crypto
+
+@c {
+    #include <fcntl.h>
+    #include <unistd.h>
+}
+
+// ── CBOR value (decode-only subset) ──────────────────────────
+// Covers what WebAuthn needs: unsigned/negative ints, byte strings,
+// text strings, arrays and maps. Floats / tags / indefinite lengths
+// are not used by attestationObject or COSE_Key.
+public class CborValue {
+    public Kind:    int            // 0=uint 1=nint 2=bytes 3=text 4=array 5=map 7=simple ; -1=absent
+    public Int:     int
+    public Bytes:   List<int>
+    public Text:    string
+    public Arr:     List<CborValue>
+    public MapKeys: List<CborValue>
+    public MapVals: List<CborValue>
+
+    public CborValue() {
+        this.Kind    = -1
+        this.Int     = 0
+        this.Bytes   = new List<int>()
+        this.Text    = ""
+        this.Arr     = new List<CborValue>()
+        this.MapKeys = new List<CborValue>()
+        this.MapVals = new List<CborValue>()
+    }
+
+    // Map lookup by integer key (COSE_Key labels). Absent → Kind -1.
+    public CborValue GetInt(key: int) {
+        let n: int = this.MapKeys.Count()
+        for i in 0..n {
+            let k: CborValue = this.MapKeys.Get(i)
+            if ((k.Kind == 0 || k.Kind == 1) && k.Int == key) {
+                return this.MapVals.Get(i)
+            }
+        }
+        return new CborValue()
+    }
+    // Map lookup by text key (attestationObject keys). Absent → Kind -1.
+    public CborValue GetText(key: string) {
+        let n: int = this.MapKeys.Count()
+        for i in 0..n {
+            let k: CborValue = this.MapKeys.Get(i)
+            if (k.Kind == 3 && k.Text == key) {
+                return this.MapVals.Get(i)
+            }
+        }
+        return new CborValue()
+    }
+}
+
+// ── CBOR reader ──────────────────────────────────────────────
+public class CborReader {
+    public Buf: List<int>
+    public Pos: int
+    public Ok:  bool
+
+    public CborReader(buf: List<int>) {
+        this.Buf = buf
+        this.Pos = 0
+        this.Ok  = true
+    }
+
+    private int byte() {
+        if (this.Pos >= this.Buf.Count()) { this.Ok = false; return 0 }
+        let b: int = this.Buf.Get(this.Pos)
+        this.Pos = this.Pos + 1
+        return b
+    }
+
+    // Read the unsigned argument encoded by additional-info `ai`.
+    private int readArg(ai: int) {
+        if (ai < 24) { return ai }
+        if (ai == 24) { return this.byte() }
+        if (ai == 25) {
+            let a: int = this.byte(); let b: int = this.byte()
+            return a * 256 + b
+        }
+        if (ai == 26) {
+            let a: int = this.byte(); let b: int = this.byte()
+            let c: int = this.byte(); let d: int = this.byte()
+            return ((a * 256 + b) * 256 + c) * 256 + d
+        }
+        if (ai == 27) {
+            // 8-byte length — far beyond anything WebAuthn carries.
+            var v: int = 0
+            for i in 0..8 { v = v * 256 + this.byte() }
+            return v
+        }
+        this.Ok = false
+        return 0
+    }
+
+    private List<int> readBytes(n: int) {
+        let out = new List<int>()
+        for i in 0..n { out.Add(this.byte()) }
+        return out
+    }
+
+    public CborValue ReadValue() {
+        let v = new CborValue()
+        if (!this.Ok) { return v }
+        let ib: int = this.byte()
+        let major: int = ib / 32
+        let ai: int = ib - major * 32
+        if (major == 0) {
+            v.Kind = 0; v.Int = this.readArg(ai); return v
+        }
+        if (major == 1) {
+            v.Kind = 1; v.Int = (0 - 1) - this.readArg(ai); return v
+        }
+        if (major == 2) {
+            let n: int = this.readArg(ai)
+            v.Kind = 2; v.Bytes = this.readBytes(n); return v
+        }
+        if (major == 3) {
+            let n: int = this.readArg(ai)
+            v.Kind = 3; v.Bytes = this.readBytes(n)
+            v.Text = Bytes.ToString(v.Bytes); return v
+        }
+        if (major == 4) {
+            let n: int = this.readArg(ai)
+            v.Kind = 4
+            for i in 0..n { v.Arr.Add(this.ReadValue()) }
+            return v
+        }
+        if (major == 5) {
+            let n: int = this.readArg(ai)
+            v.Kind = 5
+            for i in 0..n {
+                v.MapKeys.Add(this.ReadValue())
+                v.MapVals.Add(this.ReadValue())
+            }
+            return v
+        }
+        if (major == 7) {
+            v.Kind = 7; v.Int = ai
+            if (ai == 24) { this.byte() }
+            else if (ai == 25) { this.byte(); this.byte() }
+            else if (ai == 26) { for i in 0..4 { this.byte() } }
+            else if (ai == 27) { for i in 0..8 { this.byte() } }
+            return v
+        }
+        this.Ok = false
+        return v
+    }
+}
+
+// ── Results + stored credential ──────────────────────────────
+public class RegistrationResult {
+    public Ok:           bool
+    public Error:        string
+    public CredentialId: string       // base64url
+    public CoseX:        List<int>     // EC2 x coordinate
+    public CoseY:        List<int>     // EC2 y coordinate
+    public Alg:          int           // -7 (ES256)
+    public SignCount:    int
+    public UserVerified: bool
+
+    public RegistrationResult() {
+        this.Ok = false; this.Error = ""
+        this.CredentialId = ""
+        this.CoseX = new List<int>(); this.CoseY = new List<int>()
+        this.Alg = 0; this.SignCount = 0; this.UserVerified = false
+    }
+}
+
+public class AssertionResult {
+    public Ok:           bool
+    public Error:        string
+    public SignCount:    int
+    public UserVerified: bool
+
+    public AssertionResult() {
+        this.Ok = false; this.Error = ""
+        this.SignCount = 0; this.UserVerified = false
+    }
+}
+
+// What the app persists after registration and replays at login.
+public class StoredCredential {
+    public CredentialId: string
+    public CoseX:        List<int>
+    public CoseY:        List<int>
+    public SignCount:    int
+
+    public StoredCredential(credentialId: string, x: List<int>, y: List<int>, signCount: int) {
+        this.CredentialId = credentialId
+        this.CoseX        = x
+        this.CoseY        = y
+        this.SignCount    = signCount
+    }
+}
+
+// ── Relying party ────────────────────────────────────────────
+public class WebAuthn {
+    public RpId:   string         // e.g. "example.com" — the host the credential is scoped to
+    public Origin: string         // e.g. "https://example.com" — the page origin
+
+    public WebAuthn(rpId: string, origin: string) {
+        this.RpId   = rpId
+        this.Origin = origin
+    }
+
+    // A fresh 32-byte challenge, base64url (no padding). Store it in the
+    // session and pass the SAME value back to the Verify* call. CSPRNG
+    // from /dev/urandom.
+    public string NewChallenge() {
+        var out: string = ""
+        @c {
+            unsigned char buf[32];
+            int fd = open("/dev/urandom", O_RDONLY);
+            ssize_t r = (fd >= 0) ? read(fd, buf, 32) : -1;
+            if (fd >= 0) close(fd);
+            if (r == 32) {
+                /* base64url, no padding (32 bytes → 43 chars). */
+                static const char b64[] =
+                    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+                char enc[48];
+                int oi = 0;
+                for (int i = 0; i < 32; i += 3) {
+                    unsigned a = buf[i];
+                    unsigned b = (i + 1 < 32) ? buf[i + 1] : 0;
+                    unsigned c = (i + 2 < 32) ? buf[i + 2] : 0;
+                    enc[oi++] = b64[(a >> 2) & 0x3F];
+                    enc[oi++] = b64[((a << 4) | (b >> 4)) & 0x3F];
+                    if (i + 1 < 32) enc[oi++] = b64[((b << 2) | (c >> 6)) & 0x3F];
+                    if (i + 2 < 32) enc[oi++] = b64[c & 0x3F];
+                }
+                enc[oi] = 0;
+                char* s = (char*) GC_MALLOC(oi + 1);
+                memcpy(s, enc, oi + 1);
+                out = s;
+            }
+        }
+        return out
+    }
+
+    // ── Registration ─────────────────────────────────────────
+    public RegistrationResult VerifyRegistration(
+            clientDataJson: List<int>, attestationObject: List<int>, expectedChallenge: string) {
+        let r = new RegistrationResult()
+        let cdErr: string = this.checkClientData(clientDataJson, "webauthn.create", expectedChallenge)
+        if (String_Length(cdErr) > 0) { r.Error = cdErr; return r }
+
+        let reader = new CborReader(attestationObject)
+        let att: CborValue = reader.ReadValue()
+        if (!reader.Ok || att.Kind != 5) { r.Error = "attestationObject is not a CBOR map"; return r }
+        let authV: CborValue = att.GetText("authData")
+        if (authV.Kind != 2) { r.Error = "attestationObject missing authData"; return r }
+        let authData: List<int> = authV.Bytes
+
+        // authData layout: rpIdHash[32] flags[1] signCount[4] then
+        // attested-credential-data (because the AT flag is set).
+        if (authData.Count() < 37) { r.Error = "authData too short"; return r }
+        let flags: int = authData.Get(32)
+        if (!WebAuthn.FlagSet(flags, 1))  { r.Error = "user-present (UP) flag not set"; return r }
+        if (!WebAuthn.FlagSet(flags, 64)) { r.Error = "no attested credential data (AT flag clear)"; return r }
+        let uv: bool = WebAuthn.FlagSet(flags, 4)
+        let signCount: int = WebAuthn.BeU32(authData, 33)
+
+        let rpIdHash: List<int> = WebAuthn.Slice(authData, 0, 32)
+        let wantHash: List<int> = Sha256.Bytes(Bytes.FromString(this.RpId))
+        if (!WebAuthn.BytesEqual(rpIdHash, wantHash)) { r.Error = "rpIdHash mismatch"; return r }
+
+        // Attested credential data: aaguid[16] credIdLen[2] credId[..] coseKey[..]
+        if (authData.Count() < 55) { r.Error = "attested credential data truncated"; return r }
+        let credIdLen: int = WebAuthn.BeU16(authData, 53)
+        let credStart: int = 55
+        if (authData.Count() < credStart + credIdLen) { r.Error = "credential id truncated"; return r }
+        let credId: List<int> = WebAuthn.Slice(authData, credStart, credIdLen)
+        let coseStart: int = credStart + credIdLen
+        let coseBytes: List<int> = WebAuthn.Slice(authData, coseStart, authData.Count() - coseStart)
+
+        let cr2 = new CborReader(coseBytes)
+        let cose: CborValue = cr2.ReadValue()
+        if (!cr2.Ok || cose.Kind != 5) { r.Error = "COSE key is not a CBOR map"; return r }
+        let kty: CborValue = cose.GetInt(1)
+        let alg: CborValue = cose.GetInt(3)
+        let crv: CborValue = cose.GetInt(0 - 1)
+        let xV:  CborValue = cose.GetInt(0 - 2)
+        let yV:  CborValue = cose.GetInt(0 - 3)
+        if (kty.Int != 2)      { r.Error = "unsupported key type (only EC2)"; return r }
+        if (alg.Int != (0 - 7)) { r.Error = "unsupported algorithm (only ES256)"; return r }
+        if (crv.Int != 1)      { r.Error = "unsupported curve (only P-256)"; return r }
+        if (xV.Kind != 2 || yV.Kind != 2) { r.Error = "missing EC coordinates"; return r }
+
+        // Confirm the coordinates form a usable public key.
+        let testKey: JwsKey = JwsKey.FromCoseEc2(xV.Bytes, yV.Bytes)
+        if (!testKey.IsValid()) { r.Error = "invalid EC public key"; return r }
+
+        r.CredentialId = Bytes.ToBase64Url(credId)
+        r.CoseX        = xV.Bytes
+        r.CoseY        = yV.Bytes
+        r.Alg          = 0 - 7
+        r.SignCount    = signCount
+        r.UserVerified = uv
+        r.Ok           = true
+        return r
+    }
+
+    // ── Authentication ───────────────────────────────────────
+    public AssertionResult VerifyAssertion(
+            clientDataJson: List<int>, authenticatorData: List<int>,
+            signature: List<int>, cred: StoredCredential, expectedChallenge: string) {
+        let r = new AssertionResult()
+        let cdErr: string = this.checkClientData(clientDataJson, "webauthn.get", expectedChallenge)
+        if (String_Length(cdErr) > 0) { r.Error = cdErr; return r }
+
+        let authData: List<int> = authenticatorData
+        if (authData.Count() < 37) { r.Error = "authenticatorData too short"; return r }
+        let flags: int = authData.Get(32)
+        if (!WebAuthn.FlagSet(flags, 1)) { r.Error = "user-present (UP) flag not set"; return r }
+        let uv: bool = WebAuthn.FlagSet(flags, 4)
+        let signCount: int = WebAuthn.BeU32(authData, 33)
+
+        let rpIdHash: List<int> = WebAuthn.Slice(authData, 0, 32)
+        let wantHash: List<int> = Sha256.Bytes(Bytes.FromString(this.RpId))
+        if (!WebAuthn.BytesEqual(rpIdHash, wantHash)) { r.Error = "rpIdHash mismatch"; return r }
+
+        // signed data = authenticatorData ‖ SHA-256(clientDataJSON)
+        let cdHash: List<int> = Sha256.Bytes(clientDataJson)
+        let signedData: List<int> = WebAuthn.Concat(authData, cdHash)
+
+        let pub: JwsKey = JwsKey.FromCoseEc2(cred.CoseX, cred.CoseY)
+        if (!pub.IsValid()) { r.Error = "stored public key is invalid"; return r }
+        if (!pub.VerifyDer(signedData, signature)) {
+            r.Error = "assertion signature is invalid"; return r
+        }
+
+        // Cloned-authenticator detection: a non-zero counter must
+        // strictly advance. (Some authenticators always report 0 — then
+        // both sides stay 0 and the check is skipped, per spec.)
+        if (signCount != 0 || cred.SignCount != 0) {
+            if (signCount <= cred.SignCount) {
+                r.Error = "signature counter did not increase (possible cloned authenticator)"
+                return r
+            }
+        }
+
+        r.SignCount    = signCount
+        r.UserVerified = uv
+        r.Ok           = true
+        return r
+    }
+
+    // ── helpers ──────────────────────────────────────────────
+
+    // Returns "" when the client data is acceptable, else the reason.
+    private string checkClientData(clientDataJson: List<int>, expectedType: string, expectedChallenge: string) {
+        let json: string = Bytes.ToString(clientDataJson)
+        if (WebAuthn.JsonStr(json, "type") != expectedType) {
+            return "clientData.type is not " + expectedType
+        }
+        if (WebAuthn.JsonStr(json, "challenge") != expectedChallenge) {
+            return "challenge mismatch"
+        }
+        if (WebAuthn.JsonStr(json, "origin") != this.Origin) {
+            return "origin mismatch"
+        }
+        return ""
+    }
+
+    // True if the single-bit `mask` (power of two) is set in `flags`.
+    private static bool FlagSet(flags: int, mask: int) {
+        return (flags / mask) - ((flags / mask) / 2) * 2 == 1
+    }
+
+    private static int BeU16(b: List<int>, off: int) {
+        return b.Get(off) * 256 + b.Get(off + 1)
+    }
+    private static int BeU32(b: List<int>, off: int) {
+        return ((b.Get(off) * 256 + b.Get(off + 1)) * 256 + b.Get(off + 2)) * 256 + b.Get(off + 3)
+    }
+    private static List<int> Slice(b: List<int>, start: int, len: int) {
+        let out = new List<int>()
+        for i in 0..len { out.Add(b.Get(start + i)) }
+        return out
+    }
+    private static List<int> Concat(a: List<int>, b: List<int>) {
+        let out = new List<int>()
+        let na: int = a.Count()
+        for i in 0..na { out.Add(a.Get(i)) }
+        let nb: int = b.Count()
+        for j in 0..nb { out.Add(b.Get(j)) }
+        return out
+    }
+    private static bool BytesEqual(a: List<int>, b: List<int>) {
+        if (a.Count() != b.Count()) { return false }
+        var diff: int = 0
+        let n: int = a.Count()
+        for i in 0..n {
+            let xa: int = a.Get(i)
+            let xb: int = b.Get(i)
+            if (xa != xb) { diff = diff + 1 }
+        }
+        return diff == 0
+    }
+
+    // Minimal extractor for a flat JSON string field `"k":"v"`. The
+    // clientDataJSON the browser emits is flat ASCII; this is enough.
+    private static string JsonStr(json: string, name: string) {
+        let needle: string = "\"" + name + "\""
+        let pos: int = String_IndexOf(json, needle)
+        if (pos < 0) { return "" }
+        var i: int = pos + String_Length(needle)
+        let n: int = String_Length(json)
+        // skip whitespace + ':' to the opening quote
+        while (i < n) {
+            let ch: string = String_CharAt1(json, i)
+            if (ch == " " || ch == "\t" || ch == "\n" || ch == "\r" || ch == ":") { i = i + 1; continue }
+            if (ch == "\"") { i = i + 1; break }
+            return ""
+        }
+        var out: string = ""
+        var esc: bool = false
+        while (i < n) {
+            let ch: string = String_CharAt1(json, i)
+            if (esc) {
+                if (ch == "n") { out = out + "\n" }
+                else if (ch == "t") { out = out + "\t" }
+                else if (ch == "/") { out = out + "/" }
+                else { out = out + ch }
+                esc = false; i = i + 1; continue
+            }
+            if (ch == "\\") { esc = true; i = i + 1; continue }
+            if (ch == "\"") { return out }
+            out = out + ch
+            i = i + 1
+        }
+        return ""
+    }
+}

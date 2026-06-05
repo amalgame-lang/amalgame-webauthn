@@ -1,0 +1,5 @@
+*.o
+*.c
+test
+_test.am
+/build/

@@ -1,0 +1,222 @@
+// Test sample for amalgame-webauthn. Builds a real attestationObject
+// + clientDataJSON and a real ES256-signed assertion (using a generated
+// key) and drives them through the relying-party verifier.
+
+namespace UserApp
+
+import Amalgame.Collections
+import Amalgame.String
+import Amalgame.Crypto
+import Amalgame.WebAuthn
+
+public class Program {
+    public static void Main() {
+        Console.WriteLine("amalgame-webauthn — tests")
+
+        let rpId: string   = "example.com"
+        let origin: string = "https://example.com"
+        let rp = new WebAuthn(rpId, origin)
+
+        // ── NewChallenge sanity ──────────────────────────────
+        let c1: string = rp.NewChallenge()
+        let c2: string = rp.NewChallenge()
+        if (String_Length(c1) == 43 && c1 != c2) {
+            Console.WriteLine("[PASS] NewChallenge: 43-char base64url, unique")
+        } else {
+            Console.WriteLine("[FAIL] NewChallenge len=" + String_FromInt(String_Length(c1)))
+        }
+
+        // ── Build a credential keypair + its COSE key ────────
+        let kE = JwsKey.GenerateEs256()
+        let jwk: string = kE.JwkPublic()
+        let xB: List<int> = Bytes.FromBase64Url(Program.jf(jwk, "x"))
+        let yB: List<int> = Bytes.FromBase64Url(Program.jf(jwk, "y"))
+
+        // COSE_Key (EC2/ES256/P-256): {1:2, 3:-7, -1:1, -2:x, -3:y}
+        let cose = new List<int>()
+        cose.Add(0xA5)                       // map(5)
+        cose.Add(0x01); cose.Add(0x02)       // 1: 2 (kty EC2)
+        cose.Add(0x03); cose.Add(0x26)       // 3: -7 (alg ES256)
+        cose.Add(0x20); cose.Add(0x01)       // -1: 1 (crv P-256)
+        cose.Add(0x21); Program.appendAll(cose, Program.cborBytes(xB))   // -2: x
+        cose.Add(0x22); Program.appendAll(cose, Program.cborBytes(yB))   // -3: y
+
+        // credentialId (arbitrary 16 bytes)
+        let credId = new List<int>()
+        for i in 0..16 { credId.Add(100 + i) }
+
+        // rpIdHash
+        let rpHash: List<int> = Sha256.Bytes(Bytes.FromString(rpId))
+
+        // authData (registration): rpIdHash[32] flags signCount[4]
+        //   aaguid[16] credIdLen[2] credId cose
+        let authReg = new List<int>()
+        Program.appendAll(authReg, rpHash)
+        authReg.Add(0x45)                    // flags: UP(0x01) | UV(0x04) | AT(0x40)
+        Program.appendAll(authReg, Program.be32(0))     // signCount 0
+        for a in 0..16 { authReg.Add(0) }    // aaguid
+        Program.appendAll(authReg, Program.be16(16))    // credIdLen = 16
+        Program.appendAll(authReg, credId)
+        Program.appendAll(authReg, cose)
+
+        // attestationObject: {"fmt":"none","attStmt":{},"authData":authReg}
+        let att = new List<int>()
+        att.Add(0xA3)                        // map(3)
+        Program.appendAll(att, Program.cborText("fmt"))
+        Program.appendAll(att, Program.cborText("none"))
+        Program.appendAll(att, Program.cborText("attStmt"))
+        att.Add(0xA0)                        // empty map
+        Program.appendAll(att, Program.cborText("authData"))
+        Program.appendAll(att, Program.cborBytes(authReg))
+
+        let chal: string = "Y2hhbGxlbmdlLXJlZ2lzdHJhdGlvbg"
+        let cdCreate: List<int> = Bytes.FromString(
+            "{\"type\":\"webauthn.create\",\"challenge\":\"" + chal
+            + "\",\"origin\":\"" + origin + "\"}")
+
+        // ── Registration verification ────────────────────────
+        let reg: RegistrationResult = rp.VerifyRegistration(cdCreate, att, chal)
+        if (reg.Ok && reg.SignCount == 0
+            && Program.bytesEq(reg.CoseX, xB) && Program.bytesEq(reg.CoseY, yB)) {
+            Console.WriteLine("[PASS] registration extracts COSE key + credId")
+        } else {
+            Console.WriteLine("[FAIL] registration: " + reg.Error)
+        }
+
+        // Wrong origin → rejected.
+        let cdBadOrigin: List<int> = Bytes.FromString(
+            "{\"type\":\"webauthn.create\",\"challenge\":\"" + chal
+            + "\",\"origin\":\"https://evil.example\"}")
+        let regBad: RegistrationResult = rp.VerifyRegistration(cdBadOrigin, att, chal)
+        if (!regBad.Ok && String_IndexOf(regBad.Error, "origin") >= 0) {
+            Console.WriteLine("[PASS] registration rejects wrong origin")
+        } else {
+            Console.WriteLine("[FAIL] registration origin: " + regBad.Error)
+        }
+
+        // Wrong challenge → rejected.
+        let regChal: RegistrationResult = rp.VerifyRegistration(cdCreate, att, "different-challenge")
+        if (!regChal.Ok && String_IndexOf(regChal.Error, "challenge") >= 0) {
+            Console.WriteLine("[PASS] registration rejects challenge mismatch")
+        } else {
+            Console.WriteLine("[FAIL] registration challenge: " + regChal.Error)
+        }
+
+        // ── Authentication (assertion) verification ──────────
+        let stored = new StoredCredential(reg.CredentialId, reg.CoseX, reg.CoseY, reg.SignCount)
+
+        // authenticatorData (assertion): rpIdHash flags signCount (no AT)
+        let authAsr = new List<int>()
+        Program.appendAll(authAsr, rpHash)
+        authAsr.Add(0x05)                    // UP | UV
+        Program.appendAll(authAsr, Program.be32(1))     // signCount 1 (> stored 0)
+
+        let chal2: string = "Y2hhbGxlbmdlLWFzc2VydGlvbg"
+        let cdGet: List<int> = Bytes.FromString(
+            "{\"type\":\"webauthn.get\",\"challenge\":\"" + chal2
+            + "\",\"origin\":\"" + origin + "\"}")
+        let cdHash: List<int> = Sha256.Bytes(cdGet)
+        let signedData: List<int> = Program.concat(authAsr, cdHash)
+        let sig: List<int> = kE.SignDer(signedData)
+
+        let asr: AssertionResult = rp.VerifyAssertion(cdGet, authAsr, sig, stored, chal2)
+        if (asr.Ok && asr.SignCount == 1 && asr.UserVerified) {
+            Console.WriteLine("[PASS] assertion signature verifies + counter advances")
+        } else {
+            Console.WriteLine("[FAIL] assertion: " + asr.Error)
+        }
+
+        // Tampered signature → rejected.
+        let badSig = new List<int>()
+        let ns: int = sig.Count()
+        for i in 0..ns { badSig.Add(sig.Get(i)) }
+        badSig.Set(ns - 1, (badSig.Get(ns - 1) + 1) - ((badSig.Get(ns - 1) + 1) / 256) * 256)
+        let asrBad: AssertionResult = rp.VerifyAssertion(cdGet, authAsr, badSig, stored, chal2)
+        if (!asrBad.Ok && String_IndexOf(asrBad.Error, "signature") >= 0) {
+            Console.WriteLine("[PASS] assertion rejects tampered signature")
+        } else {
+            Console.WriteLine("[FAIL] assertion tamper: ok=" + (asrBad.Ok ? "T" : "F"))
+        }
+
+        // Counter not advancing (replay / clone) → rejected.
+        let storedHi = new StoredCredential(reg.CredentialId, reg.CoseX, reg.CoseY, 5)
+        let asrClone: AssertionResult = rp.VerifyAssertion(cdGet, authAsr, sig, storedHi, chal2)
+        if (!asrClone.Ok && String_IndexOf(asrClone.Error, "counter") >= 0) {
+            Console.WriteLine("[PASS] assertion rejects non-increasing counter (clone)")
+        } else {
+            Console.WriteLine("[FAIL] assertion counter: " + asrClone.Error)
+        }
+
+        // Wrong rpId (different stored origin/rp) → rpIdHash mismatch.
+        let rpOther = new WebAuthn("attacker.com", origin)
+        let asrRp: AssertionResult = rpOther.VerifyAssertion(cdGet, authAsr, sig, stored, chal2)
+        if (!asrRp.Ok && String_IndexOf(asrRp.Error, "rpIdHash") >= 0) {
+            Console.WriteLine("[PASS] assertion rejects rpIdHash mismatch")
+        } else {
+            Console.WriteLine("[FAIL] assertion rpId: " + asrRp.Error)
+        }
+
+        Console.WriteLine("done")
+    }
+
+    // ── CBOR / byte building helpers (test only) ─────────────
+
+    static List<int> cborBytes(b: List<int>) {
+        let out = new List<int>()
+        let n: int = b.Count()
+        if (n < 24) {
+            out.Add(0x40 + n)
+        } else {
+            out.Add(0x58); out.Add(n)        // 1-byte length (n ≤ 255)
+        }
+        Program.appendAll(out, b)
+        return out
+    }
+    static List<int> cborText(s: string) {
+        let b: List<int> = Bytes.FromString(s)
+        let out = new List<int>()
+        out.Add(0x60 + b.Count())            // text strings here are < 24 chars
+        Program.appendAll(out, b)
+        return out
+    }
+    static List<int> be16(n: int) {
+        let out = new List<int>()
+        out.Add((n / 256) - ((n / 256) / 256) * 256)
+        out.Add(n - (n / 256) * 256)
+        return out
+    }
+    static List<int> be32(n: int) {
+        let out = new List<int>()
+        out.Add((n / 16777216) - ((n / 16777216) / 256) * 256)
+        out.Add((n / 65536) - ((n / 65536) / 256) * 256)
+        out.Add((n / 256) - ((n / 256) / 256) * 256)
+        out.Add(n - (n / 256) * 256)
+        return out
+    }
+    static void appendAll(dst: List<int>, src: List<int>) {
+        let n: int = src.Count()
+        for i in 0..n { dst.Add(src.Get(i)) }
+    }
+    static List<int> concat(a: List<int>, b: List<int>) {
+        let out = new List<int>()
+        Program.appendAll(out, a)
+        Program.appendAll(out, b)
+        return out
+    }
+    static bool bytesEq(a: List<int>, b: List<int>) {
+        if (a.Count() != b.Count()) { return false }
+        let n: int = a.Count()
+        for i in 0..n { if (a.Get(i) != b.Get(i)) { return false } }
+        return true
+    }
+    static string jf(json: string, key: string) {
+        let needle: string = "\"" + key + "\":\""
+        let i: int = String_IndexOf(json, needle)
+        if (i < 0) { return "" }
+        let start: int = i + String_Length(needle)
+        let rest: string = String_Substring(json, start, String_Length(json) - start)
+        let end: int = String_IndexOf(rest, "\"")
+        if (end < 0) { return rest }
+        return String_Substring(rest, 0, end)
+    }
+}
